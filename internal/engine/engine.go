@@ -863,6 +863,119 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	return buf, nil
 }
 
+// BatchGetResult is the per-key outcome of one position in a BatchGet call.
+//
+// Missing keys and present-but-empty values are distinct:
+//   - A key with no live value is reported with Missing=true and Value=nil.
+//   - A key whose latest value is a zero-length PUT is reported with
+//     Missing=false and Value=[]byte{} (a non-nil, zero-length slice).
+//
+// Key is never copied back into the result — the caller already owns the
+// request keys and the result slice is positionally aligned with them, so
+// callers pair results[i] with their keys[i] rather than reading this field.
+type BatchGetResult struct {
+	Key     []byte
+	Value   []byte
+	Missing bool
+}
+
+// BatchGet reads many discrete keys in a single snapshot-consistent call.
+// It is the multi-key answer to the health-check problem that a loop of
+// individual Get calls cannot solve: successive Gets can straddle a
+// BatchPut atomic publish, a writer rotation, or a compaction commit and
+// return a mix of pre- and post-update values.
+//
+// Snapshot semantics: every key is resolved against ONE logical point in
+// time — the instant BatchGet takes its snapshot. Concretely:
+//
+//   - All keydir lookups happen under a single keydir RLock
+//     (keydir.snapshotMany), so an atomic BatchPut (published under one
+//     keydir Lock) is observed either for every key it touched or for none.
+//   - The keydir snapshot AND every value pread happen under one
+//     segmentsMu.RLock, mirroring ReadKeyRange. handleCompactCommit and
+//     rotateActive both require segmentsMu.Lock to change the segment map,
+//     so no segment a snapshot entry points at can be retired or unlinked
+//     mid-call, and Close cannot close its file descriptor.
+//
+// Output shape:
+//   - The returned slice always has len == len(keys), in request order.
+//   - A repeated key occupies a repeated result slot (no de-duplication);
+//     both slots carry the same value.
+//   - A missing key and an empty-byte value are distinguishable via the
+//     Missing flag (see BatchGetResult).
+//
+// Failure semantics are all-or-nothing: an I/O error reading any single
+// value, or a closed DB observed at any point, fails the entire call with
+// a non-nil error and a nil result — the caller never receives a partially
+// populated batch.
+//
+// An empty keys slice is a valid no-op that returns an empty (non-nil)
+// slice without touching the keydir. Each individual key must still be
+// non-empty; an empty key returns ErrEmptyKey for the whole call.
+//
+// Trade: like ReadKeyRange, peak transient memory is O(sum of the live
+// values requested) because every value is materialised while the read
+// lock is held. Snapshot correctness is deliberately preferred over a
+// streaming read that would have to re-acquire the lock per key and could
+// observe two logical time points within one call.
+func (db *DB) BatchGet(keys [][]byte) ([]BatchGetResult, error) {
+	if db.closed.Load() {
+		return nil, ErrDBClosed
+	}
+	for i, key := range keys {
+		if len(key) == 0 {
+			return nil, fmt.Errorf("%w: BatchGet key at index %d", ErrEmptyKey, i)
+		}
+	}
+	if len(keys) == 0 {
+		return []BatchGetResult{}, nil
+	}
+
+	// One RLock covers both the keydir snapshot and all preads, so the
+	// (keydir, segments) view is fixed for the whole call. Re-check closed
+	// under the lock for the same reason Get does: Close takes the write
+	// lock before nilling segments, and we must not misreport a present key
+	// as missing just because its segment was torn down.
+	db.segmentsMu.RLock()
+	defer db.segmentsMu.RUnlock()
+	if db.closed.Load() {
+		return nil, ErrDBClosed
+	}
+
+	entries, found := db.keydir.snapshotMany(keys)
+
+	results := make([]BatchGetResult, len(keys))
+	for i := range keys {
+		results[i].Key = keys[i]
+		if !found[i] {
+			results[i].Missing = true
+			// Value stays nil: the nil-vs-empty distinction is the
+			// Missing flag, but a nil value on a missing entry is also
+			// the natural zero value.
+			continue
+		}
+		seg, ok := db.segments[entries[i].fileID]
+		if !ok {
+			// Unreachable under RLock: segment-map changes need the
+			// write lock (see ReadKeyRange's identical guard). Surface
+			// as a hard failure rather than silently dropping the key,
+			// preserving all-or-nothing semantics.
+			return nil, fmt.Errorf("engine: BatchGet: keydir/segments out of sync for key %q (file %d)", keys[i], entries[i].fileID)
+		}
+		n := int(entries[i].valueLen)
+		val := make([]byte, n)
+		if n > 0 {
+			if err := seg.readAt(val, entries[i].valuePos); err != nil {
+				return nil, fmt.Errorf("engine: BatchGet read value for key %q: %w", keys[i], err)
+			}
+		}
+		// A freshly-allocated zero-length slice is non-nil, so an empty
+		// value is unambiguous against a Missing entry's nil value.
+		results[i].Value = val
+	}
+	return results, nil
+}
+
 // ReadKeyRange invokes fn(key, value) for every live key k satisfying
 // start <= k < end, in ascending key order (bytes.Compare). A nil start means
 // "from the smallest key"; a nil end means "to the largest key".

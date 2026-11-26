@@ -6,6 +6,23 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Snapshot-consistent multi-key read, end to end:
+  - Engine `DB.BatchGet(keys)` reads any number of discrete keys against a
+    single logical time point. All keydir lookups share one read lock and
+    all value reads happen under one `segmentsMu.RLock`, so a concurrent
+    `BatchPut`, segment rotation, or compaction commit can never produce a
+    mixed-before/after result. Results are positional; repeated keys occupy
+    repeated slots; missing keys and empty-byte values are distinct; any
+    single read failure fails the whole batch.
+  - Wire opcode `0x08 BATCHGET` (`u32 count | (u32 klen | key)*` request;
+    `u32 count | (u8 found | u32 vlen | val)*` single-frame response), with
+    the same pre-allocation and frame-size guards as the other batch
+    shapes.
+  - TCP server dispatch, Go client `Client.BatchGet`, and the
+    `little-db batch-get` CLI subcommand (positional keys or NDJSON on
+    stdin, `ndjson`/`raw` output).
+
 ## [0.1.0] - 2026-05-28
 
 Initial public release.

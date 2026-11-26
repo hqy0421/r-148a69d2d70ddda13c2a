@@ -21,6 +21,7 @@ func FuzzDecodeRequest(f *testing.F) {
 			{Key: []byte("a"), Value: []byte("1")},
 			{Key: []byte("b"), Delete: true},
 		}},
+		&BatchGetRequest{Keys: [][]byte{[]byte("a"), []byte("bb"), []byte("a")}},
 		&ReadKeyRangeRequest{Start: []byte("a"), End: []byte("z")},
 		&PingRequest{},
 		&StatsRequest{},

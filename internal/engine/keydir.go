@@ -139,6 +139,30 @@ func (k *keydir) size() int {
 	return n
 }
 
+// snapshotMany returns one entry per requested key, all resolved under a
+// single RLock. The returned slice has the same length and order as keys;
+// the ok slice marks position i with whether keys[i] was live at the
+// snapshot instant. It is the discrete-key analogue of snapshotRange:
+// because every lookup happens inside one critical section, a concurrent
+// BatchPut/applyBatch (which takes the write lock for its whole update)
+// can never be observed half-applied across the returned entries.
+//
+// Duplicate keys are not deduplicated: each requested position gets its
+// own independent result, matching the BatchGet contract that repeated
+// keys occupy repeated output slots.
+func (k *keydir) snapshotMany(keys [][]byte) (entries []keydirEntry, ok []bool) {
+	entries = make([]keydirEntry, len(keys))
+	ok = make([]bool, len(keys))
+	k.mu.RLock()
+	for i, key := range keys {
+		e, found := k.index[string(key)]
+		entries[i] = e
+		ok[i] = found
+	}
+	k.mu.RUnlock()
+	return entries, ok
+}
+
 // rangePair is one keydir entry plus its key, used by snapshotRange to hand
 // readers a self-contained, sorted view of a key interval.
 type rangePair struct {

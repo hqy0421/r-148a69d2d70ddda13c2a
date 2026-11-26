@@ -112,6 +112,8 @@ func TestRequestRoundTrip(t *testing.T) {
 		&ReadKeyRangeRequest{Start: []byte("a")},                   // open end
 		&ReadKeyRangeRequest{End: []byte("z")},                     // open start
 		&ReadKeyRangeRequest{Start: []byte("k"), End: []byte("k")}, // equal
+		&BatchGetRequest{Keys: [][]byte{[]byte("a"), []byte("bb"), []byte("a")}},
+		&BatchGetRequest{Keys: [][]byte{[]byte("solo")}},
 		&PingRequest{},
 		&StatsRequest{},
 	}
@@ -166,6 +168,17 @@ func requestsEqual(a, b Request) bool {
 	case *ReadKeyRangeRequest:
 		br, ok := b.(*ReadKeyRangeRequest)
 		return ok && bytes.Equal(ar.Start, br.Start) && bytes.Equal(ar.End, br.End)
+	case *BatchGetRequest:
+		br, ok := b.(*BatchGetRequest)
+		if !ok || len(ar.Keys) != len(br.Keys) {
+			return false
+		}
+		for i := range ar.Keys {
+			if !bytes.Equal(ar.Keys[i], br.Keys[i]) {
+				return false
+			}
+		}
+		return true
 	case *PingRequest:
 		_, ok := b.(*PingRequest)
 		return ok
@@ -253,6 +266,32 @@ func TestDecodeRequestRejectsInvalid(t *testing.T) {
 			b = append(b, 'z')
 			b = append(b, mustPack(uint32(1))...)
 			b = append(b, 'a')
+			return b
+		}()},
+		{"BATCHGET zero count", OpBatchGet, mustPack(uint32(0))},
+		{"BATCHGET oversize count", OpBatchGet, mustPack(uint32(MaxBatchGetKeys + 1))},
+		{"BATCHGET count exceeds remaining (pre-alloc check)", OpBatchGet, func() []byte {
+			// Claim thousands of keys but provide only 5 bytes of body.
+			b := mustPack(uint32(MaxBatchGetKeys))
+			b = append(b, 0x00, 0x00, 0x00, 0x00, 0x00)
+			return b
+		}()},
+		{"BATCHGET empty key", OpBatchGet, func() []byte {
+			b := mustPack(uint32(1))
+			b = append(b, mustPack(uint32(0))...)
+			return b
+		}()},
+		{"BATCHGET truncated key", OpBatchGet, func() []byte {
+			b := mustPack(uint32(1))
+			b = append(b, mustPack(uint32(4))...)
+			b = append(b, 'o', 'n', 'l') // only 3 of 4 promised bytes
+			return b
+		}()},
+		{"BATCHGET trailing bytes", OpBatchGet, func() []byte {
+			b := mustPack(uint32(1))
+			b = append(b, mustPack(uint32(1))...)
+			b = append(b, 'k')
+			b = append(b, 0xff) // trailing junk
 			return b
 		}()},
 		{"PING with body", OpPing, []byte{0x01}},

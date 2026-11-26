@@ -323,6 +323,12 @@ func reqMeta(req wire.Request) (op string, keyLen, valLen, entries int) {
 		return "stats", 0, 0, 0
 	case *wire.ReadKeyRangeRequest:
 		return "range", len(r.Start) + len(r.End), 0, 0
+	case *wire.BatchGetRequest:
+		keyBytes := 0
+		for _, k := range r.Keys {
+			keyBytes += len(k)
+		}
+		return "batchget", keyBytes, 0, len(r.Keys)
 	default:
 		return "unknown", 0, 0, 0
 	}
@@ -435,6 +441,9 @@ func (s *Server) dispatchOnce(conn net.Conn, req wire.Request) (wire.Status, err
 
 	case *wire.ReadKeyRangeRequest:
 		return s.handleRange(conn, r)
+
+	case *wire.BatchGetRequest:
+		return s.handleBatchGet(conn, r)
 	}
 	// Unknown concrete type; defensive.
 	return wire.StatusInternal, s.writeError(conn, wire.StatusInternal, "unknown request type")
@@ -539,6 +548,38 @@ func (s *Server) handleRange(conn net.Conn, req *wire.ReadKeyRangeRequest) (wire
 	}
 	// End-of-stream sentinel.
 	return wire.StatusOK, s.writeFrame(conn, uint8(wire.StatusOK), wire.EncodeRangeEnd())
+}
+
+// handleBatchGet serves a BATCHGET request: one snapshot-consistent read of
+// every requested key in a single engine call. The engine's BatchGet
+// already fixes one logical time point for all keys and fails the whole
+// call on any single read error, so this handler is a straight translation
+// to the wire — there is no per-entry error channel.
+//
+// Response-size policy mirrors the frame-level contract: the entire result
+// must fit in one frame, so an encoded body larger than MaxFramePayload is
+// reported as OVERLOAD (the client asked for more than a single response
+// can carry) rather than writing an un-frameable partial answer. Missing
+// keys are NOT an error status; they are encoded per entry inside the OK
+// body.
+func (s *Server) handleBatchGet(conn net.Conn, req *wire.BatchGetRequest) (wire.Status, error) {
+	results, err := s.db.BatchGet(req.Keys)
+	if err != nil {
+		return s.writeEngineErr(conn, err)
+	}
+	entries := make([]wire.BatchGetEntry, len(results))
+	for i, r := range results {
+		entries[i] = wire.BatchGetEntry{Found: !r.Missing, Value: r.Value}
+	}
+	body, err := wire.EncodeBatchGetOK(entries)
+	if err != nil {
+		// The most likely cause is a result set too large for one frame.
+		// Report OVERLOAD so the caller shrinks/chunks the request, rather
+		// than INTERNAL which would imply an engine fault.
+		return wire.StatusOverload, s.writeError(conn, wire.StatusOverload,
+			"batch-get response exceeds frame size: "+err.Error())
+	}
+	return wire.StatusOK, s.writeFrame(conn, uint8(wire.StatusOK), body)
 }
 
 // writeEngineErr maps an engine error to the corresponding wire status

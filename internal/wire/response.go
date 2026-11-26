@@ -12,6 +12,18 @@ type KV struct {
 	Value []byte
 }
 
+// BatchGetEntry is one positional result inside a BATCHGET response. The
+// engine returns results in request order, so this entry corresponds to
+// the request key at the same index and carries no key bytes of its own.
+//
+// Found=false marks a key with no live value; Value is nil in that case.
+// Found=true with a zero-length Value is a legitimate present-but-empty
+// PUT — the two conditions never collapse into one another.
+type BatchGetEntry struct {
+	Found bool
+	Value []byte
+}
+
 // EncodeError encodes the body of a non-OK response (the error envelope:
 // u16 msg_len | msg). The status byte is supplied as the frame tag at the
 // WriteFrame layer, so it does not appear in the returned body.
@@ -77,6 +89,133 @@ func DecodeGetOK(body []byte) ([]byte, error) {
 	out := make([]byte, vlen)
 	copy(out, body[4:])
 	return out, nil
+}
+
+// EncodeBatchGetOK encodes the body of a successful BATCHGET response:
+//
+//	u32 count | (u8 found | u32 vlen | val)*
+//
+// One result entry is emitted per requested key, in request order
+// (including repeated keys). A missing key is encoded with found=
+// BatchGetMissing and vlen=0; a present key uses found=BatchGetFound and
+// carries its value, which may itself be zero bytes. The whole response is
+// a single frame whose (tag + body) payload must fit MaxFramePayload — an
+// oversize result is rejected here (and, server-side, pre-empted by the
+// request key cap) rather than split across frames. The +1 mirrors
+// WriteFrame's len(body)+1 <= MaxFramePayload check.
+func EncodeBatchGetOK(entries []BatchGetEntry) ([]byte, error) {
+	if len(entries) == 0 {
+		return nil, asProtocolErr("BATCHGET response: count=0 (must be >=1)")
+	}
+	if uint64(len(entries)) >= uint64(RangeEndSentinel) {
+		return nil, asProtocolErr("BATCHGET response: count=%d collides with reserved sentinel", len(entries))
+	}
+	// Largest legal body: one status/tag byte is added at the frame layer.
+	const maxBody = uint64(MaxFramePayload) - 1
+	size := uint64(4)
+	for i, e := range entries {
+		if len(e.Value) > MaxValLen {
+			return nil, asProtocolErr("BATCHGET response entry %d: val_len=%d exceeds max=%d", i, len(e.Value), MaxValLen)
+		}
+		// u8 found + u32 vlen + val. A missing entry never carries value
+		// bytes (enforced again at write time below), so its on-wire size
+		// must exclude any Value the caller happened to leave attached.
+		vlen := len(e.Value)
+		if !e.Found {
+			vlen = 0
+		}
+		entrySize := uint64(1) + 4 + uint64(vlen)
+		if size+entrySize > maxBody {
+			return nil, asProtocolErr("BATCHGET response: encoded size would exceed frame max (entry %d pushes body to %d, max body=%d)",
+				i, size+entrySize, maxBody)
+		}
+		size += entrySize
+	}
+	buf := make([]byte, size)
+	binary.BigEndian.PutUint32(buf[0:4], uint32(len(entries)))
+	off := 4
+	for _, e := range entries {
+		if e.Found {
+			buf[off] = BatchGetFound
+		} else {
+			buf[off] = BatchGetMissing
+		}
+		off++
+		vlen := len(e.Value)
+		if !e.Found {
+			// Missing entries never carry value bytes; enforce it on the
+			// encode side so a caller bug cannot smuggle data behind a
+			// missing flag and confuse a strict decoder.
+			vlen = 0
+		}
+		binary.BigEndian.PutUint32(buf[off:off+4], uint32(vlen))
+		off += 4
+		if vlen > 0 {
+			copy(buf[off:], e.Value)
+			off += vlen
+		}
+	}
+	return buf, nil
+}
+
+// DecodeBatchGetOK parses a successful BATCHGET response body. It returns
+// one entry per requested position. A found flag other than the two known
+// values, an oversize value, or any length mismatch is a ProtocolError.
+// A missing entry decodes to Found=false with a nil Value.
+func DecodeBatchGetOK(body []byte) ([]BatchGetEntry, error) {
+	if len(body) < 4 {
+		return nil, asProtocolErr("BATCHGET response: truncated count header (have %d, want >=4)", len(body))
+	}
+	count := binary.BigEndian.Uint32(body[0:4])
+	if count == 0 {
+		return nil, asProtocolErr("BATCHGET response: count=0 (must be >=1)")
+	}
+	if count > MaxBatchGetKeys {
+		return nil, asProtocolErr("BATCHGET response: count=%d exceeds max=%d", count, MaxBatchGetKeys)
+	}
+	remaining := body[4:]
+	// Pre-allocation guard: every entry is >= u8 found + u32 vlen bytes.
+	if uint64(count)*minBatchGetResultBytes > uint64(len(remaining)) {
+		return nil, asProtocolErr("BATCHGET response: count=%d implies >=%d body bytes, have %d",
+			count, uint64(count)*minBatchGetResultBytes, len(remaining))
+	}
+	entries := make([]BatchGetEntry, 0, count)
+	off := 0
+	for i := uint32(0); i < count; i++ {
+		if off+1+4 > len(remaining) {
+			return nil, asProtocolErr("BATCHGET response entry %d: truncated header", i)
+		}
+		found := remaining[off]
+		off++
+		vlen := binary.BigEndian.Uint32(remaining[off : off+4])
+		off += 4
+		if vlen > MaxValLen {
+			return nil, asProtocolErr("BATCHGET response entry %d: val_len=%d exceeds max=%d", i, vlen, MaxValLen)
+		}
+		if uint64(off)+uint64(vlen) > uint64(len(remaining)) {
+			return nil, asProtocolErr("BATCHGET response entry %d: truncated value (need %d more bytes)", i, vlen)
+		}
+		switch found {
+		case BatchGetFound:
+			val := make([]byte, vlen)
+			copy(val, remaining[off:off+int(vlen)])
+			off += int(vlen)
+			// A zero-length make() yields a non-nil slice, preserving the
+			// present-empty vs missing distinction at the Go API level.
+			entries = append(entries, BatchGetEntry{Found: true, Value: val})
+		case BatchGetMissing:
+			if vlen != 0 {
+				return nil, asProtocolErr("BATCHGET response entry %d: missing entry must have vlen=0, got %d", i, vlen)
+			}
+			entries = append(entries, BatchGetEntry{Found: false, Value: nil})
+		default:
+			return nil, asProtocolErr("BATCHGET response entry %d: unknown found flag 0x%02x", i, found)
+		}
+	}
+	if off != len(remaining) {
+		return nil, asProtocolErr("BATCHGET response: %d trailing bytes after %d entries", len(remaining)-off, count)
+	}
+	return entries, nil
 }
 
 // EncodeStatsOK encodes the body of a successful STATS response.

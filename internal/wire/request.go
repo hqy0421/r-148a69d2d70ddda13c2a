@@ -62,6 +62,17 @@ type ReadKeyRangeRequest struct {
 
 func (*ReadKeyRangeRequest) Op() Op { return OpReadKeyRange }
 
+// BatchGetRequest carries a BATCHGET command: a snapshot-consistent read
+// of many discrete keys in one round trip. Keys are positional — the
+// response carries one result per requested position in the same order,
+// and a repeated key occupies a repeated result slot rather than being
+// de-duplicated.
+type BatchGetRequest struct {
+	Keys [][]byte
+}
+
+func (*BatchGetRequest) Op() Op { return OpBatchGet }
+
 // PingRequest carries a PING command. Body is empty.
 type PingRequest struct{}
 
@@ -100,6 +111,8 @@ func DecodeRequest(op Op, body []byte) (Request, error) {
 		return decodeBatch(body)
 	case OpReadKeyRange:
 		return decodeReadKeyRange(body)
+	case OpBatchGet:
+		return decodeBatchGet(body)
 	case OpPing:
 		if len(body) != 0 {
 			return nil, asProtocolErr("PING: expected empty body, got %d bytes", len(body))
@@ -291,6 +304,59 @@ func decodeReadKeyRange(body []byte) (*ReadKeyRangeRequest, error) {
 	return req, nil
 }
 
+// decodeBatchGet parses a BATCHGET body:
+//
+//	u32 count | (u32 klen | key)*
+//
+// The same count-based pre-allocation guard the BATCH decoder applies
+// rejects an implausible count against the remaining bytes before any
+// count-sized slice is allocated. Every key must be non-empty and within
+// MaxKeyLen; trailing bytes after the declared count are rejected.
+func decodeBatchGet(body []byte) (*BatchGetRequest, error) {
+	if len(body) < 4 {
+		return nil, asProtocolErr("BATCHGET: truncated count header (have %d, want >=4)", len(body))
+	}
+	count := binary.BigEndian.Uint32(body[0:4])
+	if count == 0 {
+		return nil, asProtocolErr("BATCHGET: count=0 (must be >=1)")
+	}
+	if count > MaxBatchGetKeys {
+		return nil, asProtocolErr("BATCHGET: count=%d exceeds max=%d", count, MaxBatchGetKeys)
+	}
+	remaining := body[4:]
+	// Every key occupies at least u32 klen + 1 key byte on the wire.
+	if uint64(count)*minBatchGetKeyBytes > uint64(len(remaining)) {
+		return nil, asProtocolErr("BATCHGET: count=%d implies >=%d body bytes, have %d",
+			count, uint64(count)*minBatchGetKeyBytes, len(remaining))
+	}
+	keys := make([][]byte, 0, count)
+	off := 0
+	for i := uint32(0); i < count; i++ {
+		if off+4 > len(remaining) {
+			return nil, asProtocolErr("BATCHGET key %d: truncated key_len", i)
+		}
+		klen := binary.BigEndian.Uint32(remaining[off : off+4])
+		off += 4
+		if klen < 1 {
+			return nil, asProtocolErr("BATCHGET key %d: empty key", i)
+		}
+		if klen > MaxKeyLen {
+			return nil, asProtocolErr("BATCHGET key %d: key_len=%d exceeds max=%d", i, klen, MaxKeyLen)
+		}
+		if uint64(off)+uint64(klen) > uint64(len(remaining)) {
+			return nil, asProtocolErr("BATCHGET key %d: truncated key (need %d more bytes)", i, klen)
+		}
+		key := make([]byte, klen)
+		copy(key, remaining[off:off+int(klen)])
+		off += int(klen)
+		keys = append(keys, key)
+	}
+	if off != len(remaining) {
+		return nil, asProtocolErr("BATCHGET: %d trailing bytes after %d keys", len(remaining)-off, count)
+	}
+	return &BatchGetRequest{Keys: keys}, nil
+}
+
 // EncodeRequest encodes a Request into a full frame (length-prefixed). This
 // is used by tests and clients; the server only decodes requests. Returns
 // an error if any field exceeds its wire limit.
@@ -326,6 +392,8 @@ func encodeRequestBody(req Request) ([]byte, error) {
 		return encodeBatch(r)
 	case *ReadKeyRangeRequest:
 		return encodeReadKeyRange(r)
+	case *BatchGetRequest:
+		return encodeBatchGet(r)
 	case *PingRequest:
 		return nil, nil
 	case *StatsRequest:
@@ -418,6 +486,47 @@ func encodeReadKeyRange(r *ReadKeyRangeRequest) ([]byte, error) {
 	off := 4 + len(r.Start)
 	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(r.End)))
 	copy(buf[off+4:], r.End)
+	return buf, nil
+}
+
+// encodeBatchGet encodes a BATCHGET request body:
+//
+//	u32 count | (u32 klen | key)*
+//
+// The encoded size is accumulated in uint64 and checked against the frame
+// budget inside the validation loop, BEFORE the result buffer is allocated,
+// so a caller naming many maximum-length keys cannot force a multi-GiB
+// allocation that EncodeFrame would only reject afterwards.
+func encodeBatchGet(r *BatchGetRequest) ([]byte, error) {
+	if len(r.Keys) == 0 {
+		return nil, asProtocolErr("BATCHGET: count=0 (must be >=1)")
+	}
+	if len(r.Keys) > MaxBatchGetKeys {
+		return nil, asProtocolErr("BATCHGET: count=%d exceeds max=%d", len(r.Keys), MaxBatchGetKeys)
+	}
+	const maxBody = uint64(MaxFramePayload) - 1
+	size := uint64(4) // u32 count
+	for i, key := range r.Keys {
+		if err := checkKey(key, "BATCHGET"); err != nil {
+			return nil, asProtocolErr("BATCHGET key %d: %s", i, err.Error())
+		}
+		entrySize := uint64(4) + uint64(len(key))
+		if size+entrySize > maxBody {
+			return nil, asProtocolErr(
+				"BATCHGET: encoded body would exceed wire max (running=%d, key=%d adds to %d, max=%d)",
+				size, i, size+entrySize, maxBody)
+		}
+		size += entrySize
+	}
+	buf := make([]byte, size)
+	binary.BigEndian.PutUint32(buf[0:4], uint32(len(r.Keys)))
+	off := 4
+	for _, key := range r.Keys {
+		binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(key)))
+		off += 4
+		copy(buf[off:], key)
+		off += len(key)
+	}
 	return buf, nil
 }
 

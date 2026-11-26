@@ -738,3 +738,170 @@ func runBatch(args []string, stdin io.Reader, stderr io.Writer) int {
 	fmt.Fprintf(stderr, "OK batch entries=%d\n", len(entries))
 	return exitOK
 }
+
+// ---------------------------------------------------------------------
+// batch-get
+// ---------------------------------------------------------------------
+
+// batchGetLine is the stdin NDJSON input shape for `batch-get -`.
+type batchGetLine struct {
+	Key string `json:"key"`
+}
+
+// runBatchGet implements the snapshot-consistent multi-key read. Keys may
+// be supplied as positional arguments or (with the "-" stdin marker) as
+// NDJSON objects carrying a base64 (or --plain literal) "key" field. The
+// output is one record per requested key, in request order; repeated keys
+// produce repeated output lines.
+func runBatchGet(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("batch-get", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	co := registerConnFlags(fs)
+	keyHex := fs.Bool("key-hex", false, "treat positional KEY args as hex (ignored for NDJSON stdin)")
+	plain := fs.Bool("plain", false,
+		"for NDJSON stdin: interpret key as a literal UTF-8 string instead of base64")
+	format := fs.String("format", "ndjson",
+		`output format: "ndjson" (default) or "raw" (KEY\tVALUE\n; missing keys print a blank VALUE field)`)
+	if err := parseFlags(fs, args); err != nil {
+		return exitUsage
+	}
+	// Validate the output format before any dial so a typo fails with
+	// exitUsage (2), not an exitTransport (1) round-trip.
+	if *format != "ndjson" && *format != "raw" {
+		fmt.Fprintf(stderr, "batch-get: unknown --format %q (want ndjson|raw)\n", *format)
+		return exitUsage
+	}
+	if fs.NArg() < 1 {
+		fmt.Fprintln(stderr, `batch-get: expected at least one KEY positional (use "-" to read NDJSON from stdin)`)
+		return exitUsage
+	}
+
+	var keys [][]byte
+	if fs.NArg() == 1 && fs.Arg(0) == "-" {
+		// Stream NDJSON key objects from stdin. Decoded with a streaming
+		// decoder for symmetry with `batch` (no fixed scanner cap).
+		dec := json.NewDecoder(stdin)
+		lineNo := 0
+		for {
+			lineNo++
+			var l batchGetLine
+			if err := dec.Decode(&l); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				fmt.Fprintf(stderr, "batch-get: entry %d: invalid JSON: %v\n", lineNo, err)
+				return exitUsage
+			}
+			key, err := decodeBatchField(l.Key, *plain)
+			if err != nil {
+				fmt.Fprintf(stderr, "batch-get: entry %d: key %v\n", lineNo, err)
+				return exitUsage
+			}
+			if err := validateKey(key, "key"); err != nil {
+				fmt.Fprintf(stderr, "batch-get: entry %d: %v\n", lineNo, err)
+				return exitUsage
+			}
+			keys = append(keys, key)
+		}
+		if len(keys) == 0 {
+			fmt.Fprintln(stderr, "batch-get: no keys on stdin")
+			return exitUsage
+		}
+	} else {
+		for i := 0; i < fs.NArg(); i++ {
+			key, err := decodeArg(fs.Arg(i), *keyHex, "key")
+			if err != nil {
+				fmt.Fprintln(stderr, err)
+				return exitUsage
+			}
+			if err := validateKey(key, "key"); err != nil {
+				fmt.Fprintf(stderr, "batch-get: %v\n", err)
+				return exitUsage
+			}
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) > wire.MaxBatchGetKeys {
+		fmt.Fprintf(stderr, "batch-get: %d keys exceeds max=%d\n", len(keys), wire.MaxBatchGetKeys)
+		return exitUsage
+	}
+
+	c, code := dialClient(co, stderr)
+	if code != exitOK {
+		return code
+	}
+	defer c.Close()
+
+	results, err := c.BatchGet(keys)
+	if err != nil {
+		return classifyErr(err, stderr)
+	}
+	if len(results) != len(keys) {
+		// Defensive: the wire contract promises positional alignment. A
+		// mismatch is a client/protocol bug, not a user-facing condition.
+		fmt.Fprintf(stderr, "batch-get: server returned %d results for %d keys\n", len(results), len(keys))
+		return exitTransport
+	}
+
+	missing := 0
+	for i, res := range results {
+		if !res.Found {
+			missing++
+		}
+		switch *format {
+		case "ndjson":
+			line := struct {
+				Found bool   `json:"found"`
+				Key   string `json:"key"`
+				Value string `json:"value,omitempty"`
+			}{
+				Found: res.Found,
+				Key:   base64.StdEncoding.EncodeToString(keys[i]),
+			}
+			if res.Found {
+				line.Value = base64.StdEncoding.EncodeToString(res.Value)
+			}
+			b, merr := json.Marshal(line)
+			if merr != nil {
+				fmt.Fprintf(stderr, "batch-get: marshal: %v\n", merr)
+				return exitTransport
+			}
+			if _, werr := stdout.Write(append(b, '\n')); werr != nil {
+				fmt.Fprintf(stderr, "batch-get: write stdout: %v\n", werr)
+				return exitTransport
+			}
+		case "raw":
+			// KEY\tVALUE\n. A missing key emits KEY\t with an empty value
+			// field; an empty present value is byte-identical in raw mode,
+			// so callers that must distinguish the two use ndjson.
+			if _, werr := stdout.Write(keys[i]); werr != nil {
+				fmt.Fprintf(stderr, "batch-get: write stdout: %v\n", werr)
+				return exitTransport
+			}
+			if _, werr := io.WriteString(stdout, "\t"); werr != nil {
+				fmt.Fprintf(stderr, "batch-get: write stdout: %v\n", werr)
+				return exitTransport
+			}
+			if res.Found {
+				if _, werr := stdout.Write(res.Value); werr != nil {
+					fmt.Fprintf(stderr, "batch-get: write stdout: %v\n", werr)
+					return exitTransport
+				}
+			}
+			if _, werr := io.WriteString(stdout, "\n"); werr != nil {
+				fmt.Fprintf(stderr, "batch-get: write stdout: %v\n", werr)
+				return exitTransport
+			}
+		}
+	}
+
+	// Mirror `get`: a not-found condition exits 4. The full result set has
+	// already been written to stdout, so a partial miss is a distinguishable
+	// exit status without losing any output. A complete miss also exits 4.
+	if missing > 0 {
+		fmt.Fprintf(stderr, "batch-get: %d of %d key(s) not found\n", missing, len(keys))
+		return exitNotFound
+	}
+	fmt.Fprintf(stderr, "OK batch-get keys=%d\n", len(keys))
+	return exitOK
+}

@@ -1,7 +1,7 @@
 // Package main is the little-db CLI binary. It exposes one server
 // subcommand (`serve`) and a set of data-plane subcommands
-// (`put`/`get`/`delete`/`range`/`batch`/`stats`/`ping`) that drive the
-// TCP server over the Go client.
+// (`put`/`get`/`delete`/`range`/`batch`/`batch-get`/`stats`/`ping`) that
+// drive the TCP server over the Go client.
 //
 // Exit codes:
 //
@@ -71,6 +71,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runRange(rest, stdout, stderr)
 	case "batch":
 		return runBatch(rest, stdin, stderr)
+	case "batch-get":
+		return runBatchGet(rest, stdin, stdout, stderr)
 	case "stats":
 		return runStats(rest, stdout, stderr)
 	case "ping":
@@ -89,14 +91,15 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage: little-db <subcommand> [flags]
 
 Subcommands:
-  serve    Run the TCP server, bound to an on-disk engine
-  put      PUT a key=value
-  get      GET a key
-  delete   DELETE a key
-  range    Stream a key range
-  batch    Submit a batch (NDJSON on stdin with "-")
-  stats    Print server stats
-  ping     Health-check the server
+  serve      Run the TCP server, bound to an on-disk engine
+  put        PUT a key=value
+  get        GET a key
+  delete     DELETE a key
+  range      Stream a key range
+  batch      Submit a batch (NDJSON on stdin with "-")
+  batch-get  Snapshot-consistent read of many keys
+  stats      Print server stats
+  ping       Health-check the server
 
 Run "little-db <subcommand> --help" for subcommand flags.`)
 }

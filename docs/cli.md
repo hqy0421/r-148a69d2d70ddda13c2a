@@ -25,6 +25,7 @@ day-2 operations (sizing, fsync, restart) see [ops.md](ops.md).
    - [`delete`](#delete)
    - [`range`](#range)
    - [`batch`](#batch)
+   - [`batch-get`](#batch-get)
    - [`stats`](#stats)
    - [`ping`](#ping)
 8. [Recipes](#recipes)
@@ -115,6 +116,7 @@ All limits are wire-protocol-level and enforced both client-side
 | Max key length          | **64 KiB**                                       |
 | Max value length        | **16 MiB**                                       |
 | Max entries per `batch` | **65 536**                                       |
+| Max keys per `batch-get`| **65 536**                                       |
 | Max encoded batch body  | **32 MiB** (`wire.MaxFramePayload - 1`)          |
 | Max range payload bytes | **64 MiB** (server `--max-range-response-bytes`) |
 
@@ -452,6 +454,85 @@ little-db batch ./testdata/users.1k.ndjson --plain
 
 See [Recipes](#recipes) for converting an arbitrary JSON file into a
 batch file.
+
+---
+
+## `batch-get`
+
+Read many discrete keys in **one snapshot-consistent** request. Every key
+is resolved against the same logical time point: even if a parallel
+`batch` write or a server-side compaction lands while the request runs,
+the response reflects either the state entirely before that event or
+entirely after it — never a mix. This is the operation to use for
+health checks and configuration reads that need several keys to tell one
+coherent story; a shell loop of individual `get` calls provides no such
+guarantee.
+
+### Synopsis
+
+```
+little-db batch-get [global flags] [--key-hex] [--format ndjson|raw] KEY [KEY ...]
+little-db batch-get [global flags] [--plain] [--format ndjson|raw] -
+```
+
+Keys are given either as positional arguments or, with the `-` source, as
+NDJSON objects `{"key":"<...>"}` on stdin (base64 by default, literal
+UTF-8 with `--plain`).
+
+### Flags
+
+| Flag        | Meaning                                                                                          |
+| ----------- | ------------------------------------------------------------------------------------------------ |
+| `--key-hex` | Treat positional KEY args as hex strings. Ignored for NDJSON stdin (which carries its own encoding). |
+| `--plain`   | NDJSON stdin only: treat `key` as a literal UTF-8 string instead of base64.                      |
+| `--format`  | `ndjson` (default, binary-safe) or `raw` (`KEY\tVALUE\n`).                                       |
+
+### Output and ordering
+
+- One output record per requested key, **in request order**. Repeating a
+  key repeats its result; keys are never de-duplicated.
+- `ndjson` (default) emits one object per line:
+
+  ```jsonc
+  {"found":true,"key":"<base64>","value":"<base64>"}
+  {"found":false,"key":"<base64>"}
+  ```
+
+  A missing key has `"found":false` and no `value` field. A present key
+  with an empty value has `"found":true` and `"value":""` — the two
+  conditions are always distinguishable.
+- `raw` emits `KEY\tVALUE\n`; a missing key prints `KEY\t` with an empty
+  value field. Because a present-empty value looks identical in raw mode,
+  use `ndjson` when that distinction matters.
+
+### Exit codes
+
+- `0` when every requested key was found.
+- `4` when one or more keys were missing. The complete result set is
+  still written to stdout first, so no output is lost; the exit status
+  only signals that at least one `found:false` record is present.
+- `2` for usage/validation errors (no keys, empty or oversize key,
+  unknown format, over the 65 536-key cap); `1`/`3`/`5` as usual for
+  transport and server errors.
+
+### Examples
+
+```bash
+# Positional keys, mixed hit and miss (exit 4, full output on stdout).
+little-db batch-get user:1 user:2 user:missing
+
+# Repeated keys each produce their own line.
+little-db batch-get user:1 user:1
+
+# Binary keys.
+little-db batch-get --key-hex 0102 0a0b
+
+# Many keys from an NDJSON file (base64, binary-safe).
+printf '{"key":"dXNlcjox"}\n{"key":"dXNlcjoy"}\n' | little-db batch-get -
+
+# Literal UTF-8 keys on stdin.
+printf '{"key":"user:1"}\n' | little-db batch-get --plain -
+```
 
 ---
 

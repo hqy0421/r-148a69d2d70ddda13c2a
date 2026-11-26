@@ -40,6 +40,10 @@ their bytes between the API call and the platter.
 - Background compaction with hint files.
 - Crash recovery on `Open`.
 - The five required API operations: `Put`, `Read`, `ReadKeyRange`, `BatchPut`, `Delete`.
+- `BatchGet` (discrete-key snapshot read): one call reads many
+  non-contiguous keys at a single logical time point — added because
+  health checks need cross-key atomic reads without the O(total_keys) cost
+  of a `ReadKeyRange`. See §4.6.
 - TCP server with a custom length-prefixed binary protocol.
 - A minimal CLI client.
 - Async single-leader replication — **planned bonus branch only**; integration point documented here, not implemented on `main`.
@@ -126,7 +130,8 @@ rather than a key+value pair. See §7.1 for the exhaustive record table.
   keydir under a single write lock, so a `ReadKeyRange` (which takes one
   RLock for the whole scan) observes either none or all of the batch.
   A caller-side loop of individual `Get` calls is not a snapshot — use
-  `ReadKeyRange` for cross-key atomic reads.
+  `ReadKeyRange` for cross-key atomic reads over an interval, or
+  `BatchGet` (§4.6) for a discrete set of keys.
 - Mixed PUT + DELETE in the same batch is allowed via the inner `op_flag` byte
   (0 = PUT, 1 = TOMBSTONE).
 - Single fsync at the end of the batch in sync mode (group commit).
@@ -153,6 +158,51 @@ rather than a key+value pair. See §7.1 for the exhaustive record table.
 - Appends a tombstone record. Idempotent.
 - Returns `nil` even if the key did not exist (no read-before-delete).
 - Tombstones are reclaimed by compaction (§7.3) after a grace period.
+
+### 4.6 `BatchGet(keys [][]byte) → ([]BatchGetResult, error)`
+
+A snapshot-consistent read of many **discrete** keys in one call. The
+motivating use case is a health check that reads several configuration
+keys spread far across the keyspace: a caller-side loop of individual
+`Read` calls can straddle an atomic `BatchPut`, a segment rotation, or a
+compaction commit and observe values from two different time points.
+`ReadKeyRange` already offers snapshot semantics but scans the whole
+keydir and forces the caller to name a contiguous interval; `BatchGet`
+pays O(m) map lookups for exactly the m keys named.
+
+- **Snapshot consistency.** All keydir lookups happen under a single
+  keydir read lock (`keydir.snapshotMany`), so a `BatchPut` published
+  under one write lock (§4.4) is observed either for every key it touched
+  or for none. The keydir snapshot **and** every value `pread` happen
+  under one `segmentsMu.RLock`, identical to the `ReadKeyRange`
+  materialisation in §13.4: no rotation or compaction commit (both of
+  which need the write lock) can retire a segment mid-call, and `Close`
+  cannot close its file descriptor. The whole query therefore observes one
+  logical time point even while parallel batch writes or compaction run.
+- **Output shape.** The result slice always has the same length and order
+  as `keys`. Repeated keys are not de-duplicated — each requested position
+  gets its own result entry, and repeated positions carry equal values.
+- **Missing vs empty.** A key with no live value (never written, deleted)
+  is reported with `Missing=true` and a nil value; a key whose latest
+  value is a zero-length PUT is reported with `Missing=false` and a
+  non-nil zero-length slice. The two never collapse.
+- **All-or-nothing failure.** An I/O error reading any one value (or a
+  closed DB observed at any point) fails the entire call with a non-nil
+  error and no partial results. Over the wire, a response that would
+  exceed the single-frame size cap likewise fails the whole call
+  (`OVERLOAD`) rather than returning a truncated batch.
+- An empty key list is a valid no-op returning an empty result. Any
+  individual empty key fails the whole call with `ErrEmptyKey`.
+- Peak transient memory is O(sum of the live values requested), the same
+  trade `ReadKeyRange` makes for snapshot correctness (§13.4).
+
+```go
+type BatchGetResult struct {
+    Key     []byte
+    Value   []byte
+    Missing bool
+}
+```
 
 ## 5. Non-functional requirements
 

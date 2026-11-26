@@ -248,6 +248,32 @@ func (c *Client) Stats() (keyCount, bytesOnDisk uint64, err error) {
 	return wire.DecodeStatsOK(body)
 }
 
+// BatchGet reads many discrete keys in one snapshot-consistent round trip.
+// The returned slice has one entry per requested key, in the same order;
+// repeated keys yield repeated (identical) entries and are not de-duplicated.
+//
+// Unlike Get, a missing key is NOT an error here: its entry has Found=false.
+// A present key whose value is empty returns Found=true with a zero-length
+// value, so the two cases stay distinguishable. Any server-side failure
+// (transport, BAD_REQUEST, OVERLOAD, CLOSED) fails the whole call and
+// returns a nil slice — the batch is all-or-nothing.
+//
+// A nil or empty keys slice is rejected locally: the wire format requires at
+// least one key (a zero-count request is a BAD_REQUEST).
+func (c *Client) BatchGet(keys [][]byte) ([]wire.BatchGetEntry, error) {
+	if len(keys) == 0 {
+		return nil, errors.New("client: BatchGet requires at least one key")
+	}
+	status, body, err := c.roundTripUnary(&wire.BatchGetRequest{Keys: keys})
+	if err != nil {
+		return nil, err
+	}
+	if status != wire.StatusOK {
+		return nil, statusToErr(status, body)
+	}
+	return wire.DecodeBatchGetOK(body)
+}
+
 // ReadKeyRange streams (key, value) pairs in [start, end). Either bound
 // may be nil for open-ended. For each page, pageFn is invoked with the
 // decoded pairs; if pageFn returns false, the stream is abandoned and

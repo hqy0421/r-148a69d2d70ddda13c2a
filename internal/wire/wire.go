@@ -29,6 +29,10 @@
 //	                       slen=0 means "open start"; elen=0 means "open end"
 //	0x06 PING            (empty body)
 //	0x07 STATS           (empty body)
+//	0x08 BATCHGET        u32 count | (u32 klen | key)*   (count 1..MaxBatchGetKeys)
+//	                       snapshot-consistent multi-key read; the OK response
+//	                       is one frame whose body carries one result per
+//	                       requested position (see EncodeBatchGetOK)
 //
 // Statuses (response tags):
 //
@@ -48,6 +52,9 @@
 //	PUT/DELETE/BATCH/PING: empty
 //	GET:    u32 vlen | val
 //	STATS:  u64 key_count | u64 bytes_on_disk
+//	BATCHGET: u32 count | (u8 found | u32 vlen | val)*  — one entry per
+//	  requested key, in request order; found=0 marks a missing key (vlen=0),
+//	  found=1 carries the value (which may itself be zero-length)
 //	READKEYRANGE: a stream of frames, each either:
 //	  - a page: status=OK, body = u32 pair_count | (u32 klen|key|u32 vlen|val)*
 //	  - the end: status=OK, body = u32 0xFFFFFFFF
@@ -78,6 +85,25 @@ const (
 	// 65_536 * (10-byte entry minimum) leaves room for non-trivial keys
 	// and values without approaching MaxFramePayload.
 	MaxBatchEntries = 65_536
+
+	// MaxBatchGetKeys caps how many discrete keys one BATCHGET request may
+	// name (and therefore how many result entries one BATCHGET response may
+	// carry). It mirrors MaxBatchEntries so the two batch-shaped operations
+	// share one allocation bound: 65_536 * the minimum key-encoding (5
+	// bytes) is far below MaxFramePayload, while still bounding the
+	// decoder's pre-allocation against a crafted count.
+	MaxBatchGetKeys = 65_536
+
+	// minBatchGetKeyBytes is the smallest possible encoding of one key
+	// inside a BATCHGET request: u32 klen + 1-byte key = 5. It is the
+	// multiplier the decoder's count-based pre-allocation guard uses, the
+	// same defensive pattern as the BATCH entry check.
+	minBatchGetKeyBytes = 5
+
+	// minBatchGetResultBytes is the smallest encoding of one result entry
+	// inside a BATCHGET response: u8 found + u32 vlen (= 0) = 5. Used by
+	// the response decoder's pre-allocation guard.
+	minBatchGetResultBytes = 5
 
 	// MaxErrMsgLen bounds the human-readable error message that
 	// accompanies every non-OK status. Keeps responses cheap and stops
@@ -116,6 +142,7 @@ const (
 	OpReadKeyRange Op = 0x05
 	OpPing         Op = 0x06
 	OpStats        Op = 0x07
+	OpBatchGet     Op = 0x08
 )
 
 // String returns a stable name for the opcode, useful for log lines.
@@ -135,6 +162,8 @@ func (o Op) String() string {
 		return "PING"
 	case OpStats:
 		return "STATS"
+	case OpBatchGet:
+		return "BATCHGET"
 	default:
 		return "UNKNOWN"
 	}
@@ -176,4 +205,16 @@ func (s Status) String() string {
 const (
 	BatchOpPut    uint8 = 0x00
 	BatchOpDelete uint8 = 0x01
+)
+
+// BATCHGET per-result presence flags. These occupy the `found` byte of
+// each response entry and deliberately do not reuse the response-level
+// Status codes: an entire BATCHGET call still answers with one OK frame
+// even when some individual keys are absent, and the per-entry flag is how
+// that absence is expressed. A missing key (found=0) and a present but
+// zero-length value (found=1, vlen=0) are therefore distinguishable on
+// the wire.
+const (
+	BatchGetMissing uint8 = 0x00
+	BatchGetFound   uint8 = 0x01
 )

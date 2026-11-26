@@ -21,7 +21,7 @@ modes) live in [docs/ops.md](docs/ops.md).
 - **Single static binary**, single data directory, POSIX-only.
 - **Crash-safe**: writes survive `kill -9` when `--sync-on-put` is on
   (see [§ Durability and fsync](#durability-and-fsync)).
-- **API**: `Put`, `Get`, `Delete`, `BatchPut`, `ReadKeyRange`, `Stats`.
+- **API**: `Put`, `Get`, `BatchGet`, `Delete`, `BatchPut`, `ReadKeyRange`, `Stats`.
 - **Wire**: framed binary protocol over TCP (see
   [docs/SPEC.md §5](docs/SPEC.md)).
 - **No external dependencies** at runtime or build time.
@@ -71,6 +71,7 @@ recipes — lives in [docs/cli.md](docs/cli.md).
 | `delete`   | Tombstone one key.                                       |
 | `range`    | Stream `[--start, --end)` to stdout (`ndjson` or `raw`). |
 | `batch`    | Atomic multi-op from NDJSON (`--plain` or base64).       |
+| `batch-get`| Snapshot-consistent read of many keys at one time point. |
 | `stats`    | `key_count=… bytes_on_disk=…`.                           |
 | `ping`     | `pong` on success.                                       |
 
